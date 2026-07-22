@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -62,6 +63,7 @@ func (b *WebSocket) SetMessageHandler(handler MessageHandler) {
 
 type WebSocket struct {
 	conn         *websocket.Conn
+	writeMu      sync.Mutex
 	url          string
 	apiKey       string
 	apiSecret    string
@@ -139,6 +141,13 @@ func (b *WebSocket) Connect() *WebSocket {
 	}
 
 	b.conn, _, err = dialer.Dial(wssUrl, nil)
+	if err != nil || b.conn == nil {
+		// Dial failed: leave the socket non-connected and do NOT spawn any
+		// goroutine or attempt a write against a nil conn. Callers detect
+		// failure via isConnected (mirrors the sendAuth error branch below).
+		b.isConnected = false
+		return b
+	}
 
 	if b.requiresAuthentication() {
 		if err = b.sendAuth(); err != nil {
@@ -215,7 +224,13 @@ func ping(b *WebSocket) {
 			if err != nil {
 				continue
 			}
-			if err := b.conn.WriteMessage(websocket.TextMessage, jsonPingMessage); err != nil {
+			if b.conn == nil {
+				return
+			}
+			b.writeMu.Lock()
+			err = b.conn.WriteMessage(websocket.TextMessage, jsonPingMessage)
+			b.writeMu.Unlock()
+			if err != nil {
 				return
 			}
 
@@ -271,5 +286,10 @@ func (b *WebSocket) sendAsJson(v interface{}) error {
 }
 
 func (b *WebSocket) send(message string) error {
+	if b.conn == nil {
+		return fmt.Errorf("websocket is not connected")
+	}
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
 	return b.conn.WriteMessage(websocket.TextMessage, []byte(message))
 }
