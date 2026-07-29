@@ -18,8 +18,18 @@ import (
 type MessageHandler func(message string) error
 
 func (b *WebSocket) handleIncomingMessages() {
+	// Snapshot the socket this reader owns. Reading b.conn every iteration races
+	// a concurrent reconnect that is in the middle of replacing it, and a nil
+	// read there is a panic in a goroutine — which takes the whole process down,
+	// not just the socket. Bailing out instead lets monitorConnection redial.
+	conn := b.conn
+	if conn == nil {
+		b.isConnected = false
+		return
+	}
+
 	for {
-		_, message, err := b.conn.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
 			b.isConnected = false
 			return
@@ -41,12 +51,17 @@ func (b *WebSocket) monitorConnection() {
 	for {
 		<-ticker.C
 		if !b.isConnected && b.ctx.Err() == nil { // Check if disconnected and context not done
-			con := b.Connect() // Example, adjust parameters as needed
-			if con == nil {
-			} else {
-				b.isConnected = true
-				go b.handleIncomingMessages() // Restart message handling
-			}
+			// redial, not Connect: Connect reports a dial failure by returning the
+			// RECEIVER (so callers can keep using the value) while leaving conn nil
+			// and isConnected false. Reading that non-nil return as success is what
+			// set isConnected = true and started a reader against a nil conn — a
+			// nil-pointer panic in a goroutine, i.e. the process dies.
+			//
+			// Connect is also the wrong call for a reconnect on its own terms: it
+			// starts monitorConnection and ping and installs a fresh context, so
+			// driving it from the monitor doubles all three every time the socket
+			// drops, and leaves two readers racing ReadMessage on one connection.
+			b.redial()
 		}
 
 		select {
@@ -124,6 +139,72 @@ func NewBybitPublicWebSocket(url string, handler MessageHandler) *WebSocket {
 	return c
 }
 
+// dialer builds the websocket dialer, applying the proxy when one is configured.
+//
+// Split out because Connect and redial must dial the same way; when the proxy
+// setup lived inline in Connect, a reconnect could only be done by calling
+// Connect itself, which does far more than dial.
+func (b *WebSocket) dialer() (*websocket.Dialer, error) {
+	if b.proxyURL == "" {
+		return websocket.DefaultDialer, nil
+	}
+	proxyURL, err := url.Parse(b.proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	// Copy rather than mutating DefaultDialer: it is package-level shared state,
+	// so setting Proxy on it configures every other dialer in the process too.
+	d := *websocket.DefaultDialer
+	d.Proxy = http.ProxyURL(proxyURL)
+	return &d, nil
+}
+
+// redial re-establishes a dropped socket and restarts ONLY the reader, reporting
+// whether the connection is usable afterwards.
+//
+// This is the reconnect path, deliberately distinct from Connect. Connect is the
+// one-time setup: besides dialing it starts monitorConnection and ping and
+// installs the context those two watch. Reconnecting through it therefore adds a
+// second monitor, a second pinger and a fresh context on every drop, orphaning
+// the cancel the caller holds. redial touches only what a reconnect actually
+// needs to replace.
+//
+// On any failure the socket is left nil and disconnected, so the next monitor
+// tick retries rather than a reader being started against a half-open one.
+func (b *WebSocket) redial() bool {
+	dialer, err := b.dialer()
+	if err != nil {
+		b.isConnected = false
+		return false
+	}
+
+	wssUrl := b.url
+	if b.maxAliveTime != "" {
+		wssUrl += "?max_alive_time=" + b.maxAliveTime
+	}
+
+	conn, _, err := dialer.Dial(wssUrl, nil)
+	if err != nil || conn == nil {
+		b.conn = nil
+		b.isConnected = false
+		return false
+	}
+	b.conn = conn
+
+	if b.requiresAuthentication() {
+		if err := b.sendAuth(); err != nil {
+			_ = conn.Close()
+			b.conn = nil
+			b.isConnected = false
+			return false
+		}
+	}
+
+	b.isConnected = true
+	go b.handleIncomingMessages()
+	return true
+}
+
 func (b *WebSocket) Connect() *WebSocket {
 	var err error
 	wssUrl := b.url
@@ -131,13 +212,9 @@ func (b *WebSocket) Connect() *WebSocket {
 		wssUrl += "?max_alive_time=" + b.maxAliveTime
 	}
 
-	dialer := websocket.DefaultDialer
-	if b.proxyURL != "" {
-		proxyURL, err := url.Parse(b.proxyURL)
-		if err != nil {
-			return nil
-		}
-		dialer.Proxy = http.ProxyURL(proxyURL)
+	dialer, err := b.dialer()
+	if err != nil {
+		return nil
 	}
 
 	b.conn, _, err = dialer.Dial(wssUrl, nil)
@@ -151,6 +228,12 @@ func (b *WebSocket) Connect() *WebSocket {
 
 	if b.requiresAuthentication() {
 		if err = b.sendAuth(); err != nil {
+			// The dial succeeded, so without this the failed attempt leaves a live
+			// unauthenticated socket in b.conn that nothing ever closes — the next
+			// reconnect just overwrites the field and leaks it.
+			_ = b.conn.Close()
+			b.conn = nil
+			b.isConnected = false
 			return nil
 		}
 	}
@@ -243,6 +326,11 @@ func ping(b *WebSocket) {
 func (b *WebSocket) Disconnect() error {
 	b.cancel()
 	b.isConnected = false
+	// A WebSocket whose Connect failed to dial has a nil conn, and Disconnect is
+	// exactly what a caller runs on that failure path.
+	if b.conn == nil {
+		return nil
+	}
 	return b.conn.Close()
 }
 
